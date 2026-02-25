@@ -1,0 +1,86 @@
+name: Build Windows Executable
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Locate library paths for bundling
+        id: libs
+        shell: python
+        run: |
+          import os
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+
+          # zxing-cpp (compiled .pyd — PyInstaller collects automatically,
+          # but we add collect-all to be safe)
+          try:
+              import zxingcpp
+              out.write(f"zxingcpp_dir={os.path.dirname(zxingcpp.__file__)}\n")
+              out.write("has_zxingcpp=true\n")
+          except ImportError:
+              out.write("has_zxingcpp=false\n")
+
+          # pyzbar (fallback — bundles zbar DLLs)
+          try:
+              import pyzbar
+              out.write(f"pyzbar_dir={os.path.dirname(pyzbar.__file__)}\n")
+              out.write("has_pyzbar=true\n")
+          except ImportError:
+              out.write("has_pyzbar=false\n")
+
+          out.close()
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          $args = @(
+            "--onefile",
+            "--windowed",
+            "--name", "MedicineCapture",
+            "--hidden-import=pyttsx3.drivers",
+            "--hidden-import=pyttsx3.drivers.sapi5"
+          )
+
+          # zxing-cpp
+          if ("${{ steps.libs.outputs.has_zxingcpp }}" -eq "true") {
+            $args += "--collect-all=zxingcpp"
+            $args += "--hidden-import=zxingcpp"
+          }
+
+          # pyzbar (fallback)
+          if ("${{ steps.libs.outputs.has_pyzbar }}" -eq "true") {
+            $dir = "${{ steps.libs.outputs.pyzbar_dir }}"
+            $args += "--add-data=${dir};pyzbar"
+            $args += "--hidden-import=pyzbar.pyzbar"
+          }
+
+          $args += "main.py"
+          pyinstaller @args
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MedicineCapture.exe
+          generate_release_notes: true
