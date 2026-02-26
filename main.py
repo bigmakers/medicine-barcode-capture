@@ -410,7 +410,9 @@ class CameraThread(threading.Thread):
 
         barcodes = decode_barcodes(frame)
         if not barcodes:
-            self.last_detected_barcode = None
+            if self.last_detected_barcode is not None:
+                self.last_detected_barcode = None
+                self.app.after(0, lambda: self.app.medicine_name_var.set(""))
             return
 
         bc = barcodes[0]
@@ -617,6 +619,16 @@ class App(ctk.CTk):
         self.preview = tk.Label(tab, bg="#1a1a1a", text="カメラ未接続", fg="gray")
         self.preview.pack(fill="both", expand=True, padx=5, pady=5)
 
+        # 薬品名表示ラベル
+        self.medicine_name_var = ctk.StringVar(value="")
+        self.medicine_name_label = ctk.CTkLabel(
+            tab, textvariable=self.medicine_name_var,
+            font=ctk.CTkFont(size=28, weight="bold"),
+            text_color="#00e0ff",
+            height=50,
+        )
+        self.medicine_name_label.pack(fill="x", padx=5, pady=(0, 5))
+
     def _build_barcode_tab(self):
         """バーコード登録タブを構築。"""
         tab = self.tabview.add("バーコード登録")
@@ -723,10 +735,20 @@ class App(ctk.CTk):
         self._refresh_barcode_list()
 
     def _update_barcode_scan_display(self, barcode_data: str):
-        """バーコード登録タブのスキャン表示を更新（メインスレッドから呼ぶ）。"""
+        """バーコード検知時の表示更新（メインスレッドから呼ぶ）。"""
         self._reg_scanned_barcode = barcode_data
-        # 登録済みか確認して表示に反映
+        # 登録済みか確認
         existing = self.db.lookup_barcode(barcode_data) if self.db else None
+
+        # カメラタブの薬品名ラベルを更新
+        if existing:
+            self.medicine_name_var.set(existing)
+            self.medicine_name_label.configure(text_color="#00e0ff")
+        else:
+            self.medicine_name_var.set(f"未登録: {barcode_data[:30]}")
+            self.medicine_name_label.configure(text_color="#888888")
+
+        # バーコード登録タブの表示も更新
         if existing:
             self.reg_barcode_var.set(f"{barcode_data} （登録済み: {existing}）")
         else:
