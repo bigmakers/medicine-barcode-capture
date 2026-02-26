@@ -300,7 +300,6 @@ class CameraThread(threading.Thread):
         # ── 撮影制御 ──
         self.is_capturing = False
         self.capture_progress = 0
-        self.dialog_shown = False
         self.cooldown_until = 0.0      # 撮影後の再検知抑制
 
         # ── バーコード読み上げ（撮影とは独立） ──
@@ -339,7 +338,7 @@ class CameraThread(threading.Thread):
 
             display = frame.copy()
 
-            if not self.is_capturing and not self.dialog_shown:
+            if not self.is_capturing:
                 self._step_state_machine(frame, display)
 
             # バーコード読み上げ（撮影トリガーとは独立）
@@ -364,14 +363,15 @@ class CameraThread(threading.Thread):
             self.state = STATE_IDLE
             return
 
-        # ── IDLE: 変化待ち → 動体検知で即ダイアログ ──
+        # ── IDLE: 変化待ち → 動体検知で即撮影開始 ──
         if self.state == STATE_IDLE:
             if has_motion:
                 self.state = STATE_TRIGGERED
-                self.dialog_shown = True
-                self.app.after(0, lambda: self.app.show_confirm_dialog())
+                self.is_capturing = True
+                self.capture_progress = 0
+                self.app.after(0, lambda: self.app._start_capture())
 
-        # ── TRIGGERED: ダイアログ表示中 ──
+        # ── TRIGGERED: 撮影中 ──
         elif self.state == STATE_TRIGGERED:
             pass
 
@@ -523,7 +523,6 @@ class CameraThread(threading.Thread):
 
     def reset_for_next(self):
         """撮影完了後のリセット。クールダウン付きで IDLE に戻す。"""
-        self.dialog_shown = False
         self.cooldown_until = time.time() + MOTION_COOLDOWN_SEC
         self.state = STATE_IDLE
 
@@ -841,53 +840,11 @@ class App(ctk.CTk):
             self.set_status(f"エラー: テスト撮影の保存に失敗しました")
 
     # ────────────────────────────────────
-    #  確認ダイアログ & 撮影シーケンス
+    #  撮影シーケンス
     # ────────────────────────────────────
-    def show_confirm_dialog(self):
-        """動体検知時の登録確認ダイアログ。"""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("物体検知")
-        dialog.geometry("400x180")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.grab_set()
-
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 400) // 2
-        y = self.winfo_y() + (self.winfo_height() - 180) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        ctk.CTkLabel(
-            dialog, text="物体を検知しました",
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).pack(pady=(20, 10))
-        ctk.CTkLabel(dialog, text="登録しますか？", font=ctk.CTkFont(size=14)).pack(pady=10)
-
-        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_frame.pack(pady=10)
-
-        def on_register():
-            dialog.destroy()
-            self._start_capture()
-
-        def on_cancel():
-            dialog.destroy()
-            if self.camera_thread:
-                self.camera_thread.reset_for_next()
-
-        ctk.CTkButton(btn_frame, text="登録する", width=120, command=on_register).pack(
-            side="left", padx=10
-        )
-        ctk.CTkButton(
-            btn_frame, text="キャンセル", width=120, fg_color="gray", command=on_cancel
-        ).pack(side="left", padx=10)
-
-        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-
     def _start_capture(self):
-        if self.camera_thread:
-            self.camera_thread.is_capturing = True
-            self.camera_thread.capture_progress = 0
+        """動体検知から直接呼ばれる。即座に撮影を開始する。"""
+        self.tts.speak("撮影開始")
         threading.Thread(
             target=self._capture_sequence,
             daemon=True,
