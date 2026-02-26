@@ -7,6 +7,7 @@ CZUR Shine 書画カメラ対応
 
 import os
 import sys
+import json
 import queue
 import time
 import threading
@@ -56,6 +57,7 @@ PREVIEW_MAX_W = 960
 PREVIEW_MAX_H = 540
 DEFAULT_BASE_DIR = str(Path.home() / "MedicineCaptures")
 DB_NAME = "captures.db"
+CONFIG_PATH = str(Path.home() / ".medicine_capture_config.json")
 
 # ── 動体検知パラメータ ──
 MOTION_AREA_RATIO = 0.005       # 画面面積のこの割合以上が変化 → 動体あり
@@ -543,8 +545,9 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.base_dir = ctk.StringVar(value=DEFAULT_BASE_DIR)
-        self.camera_index = ctk.IntVar(value=0)
+        saved_config = self._load_config()
+        self.base_dir = ctk.StringVar(value=saved_config.get("base_dir", DEFAULT_BASE_DIR))
+        self.camera_index = ctk.IntVar(value=saved_config.get("camera_index", 0))
 
         self.camera_thread: CameraThread | None = None
         self.tts = TTSWorker()
@@ -554,6 +557,26 @@ class App(ctk.CTk):
 
         self._build_ui()
         self._init_db()
+
+    def _load_config(self) -> dict:
+        """設定ファイルを読み込む。"""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self):
+        """現在の設定をファイルに保存する。"""
+        config = {
+            "base_dir": self.base_dir.get(),
+            "camera_index": self.camera_index.get(),
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"設定保存エラー: {e}")
 
     def _init_db(self):
         os.makedirs(self.base_dir.get(), exist_ok=True)
@@ -825,6 +848,7 @@ class App(ctk.CTk):
         d = filedialog.askdirectory(initialdir=self.base_dir.get())
         if d:
             self.base_dir.set(d)
+            self._save_config()
             self._init_db()
 
     def _open_save_dir(self):
@@ -1041,6 +1065,7 @@ class App(ctk.CTk):
     #  終了処理
     # ────────────────────────────────────
     def on_closing(self):
+        self._save_config()
         self.stop_camera()
         self.tts.shutdown()
         self.destroy()
