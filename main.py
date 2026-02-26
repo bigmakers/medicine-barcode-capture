@@ -110,6 +110,21 @@ def decode_barcodes(frame):
     return results
 
 
+def save_frame_as_jpg(filepath: str, frame, quality: int = 95) -> bool:
+    """フレームをJPEGで保存する。cv2.imwrite は非ASCII パスで失敗するため imencode を使用。"""
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            print(f"エラー: JPEG エンコード失敗 — {filepath}")
+            return False
+        Path(filepath).write_bytes(buf.tobytes())
+        print(f"保存: {filepath}")
+        return True
+    except Exception as e:
+        print(f"エラー: 保存失敗 — {filepath}: {e}")
+        return False
+
+
 def open_file(filepath: str):
     """OS既定のアプリケーションでファイルを開く。"""
     if not os.path.exists(filepath):
@@ -660,9 +675,11 @@ class App(ctk.CTk):
         os.makedirs(save_dir, exist_ok=True)
 
         self.after(0, lambda: self.set_status(f"撮影中 0/{CAPTURE_COUNT} — {barcode_data}"))
+        saved_count = 0
 
         for i in range(CAPTURE_COUNT):
             if i == 0:
+                # リングバッファの最古フレーム（≒2秒前）
                 frame, ts = (
                     self.camera_thread.get_buffer_frame()
                     if self.camera_thread
@@ -679,22 +696,23 @@ class App(ctk.CTk):
                 )
 
             if frame is None:
+                print(f"警告: フレーム {i + 1}/{CAPTURE_COUNT} が None — スキップ")
                 continue
 
             ts = ts or datetime.now()
             filename = f"{ts.strftime('%Y%m%d_%H%M%S')}_{i + 1:02d}.jpg"
             filepath = os.path.join(save_dir, filename)
 
-            cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-            self.db.insert(
-                barcode=barcode_data,
-                barcode_type=barcode_type,
-                filename=filename,
-                filepath=filepath,
-                captured_at=ts.strftime("%Y-%m-%d %H:%M:%S"),
-                session_id=session_id,
-            )
+            if save_frame_as_jpg(filepath, frame):
+                saved_count += 1
+                self.db.insert(
+                    barcode=barcode_data,
+                    barcode_type=barcode_type,
+                    filename=filename,
+                    filepath=filepath,
+                    captured_at=ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    session_id=session_id,
+                )
 
             count = i + 1
             if self.camera_thread:
@@ -710,10 +728,11 @@ class App(ctk.CTk):
             self.camera_thread.capture_progress = 0
             self.camera_thread.reset_for_next()
 
-        self.after(
-            0, lambda: self.set_status(f"撮影完了: {CAPTURE_COUNT}枚保存 ({barcode_data})")
-        )
-        self.tts.speak(f"登録完了。バーコード {barcode_data}")
+        msg = f"撮影完了: {saved_count}/{CAPTURE_COUNT}枚保存 ({barcode_data})"
+        self.after(0, lambda: self.set_status(msg))
+        print(msg)
+        print(f"保存先: {save_dir}")
+        self.tts.speak(f"登録完了。{saved_count}枚保存しました。バーコード {barcode_data}")
 
     # ────────────────────────────────────
     #  検索
