@@ -338,7 +338,7 @@ class CameraThread(threading.Thread):
 
             display = frame.copy()
 
-            if not self.is_capturing:
+            if not self.is_capturing and not self.app.is_barcode_register_mode():
                 self._step_state_machine(frame, display)
 
             # バーコード読み上げ（撮影トリガーとは独立）
@@ -775,6 +775,13 @@ class App(ctk.CTk):
         self.preview.configure(image="", text="カメラ未接続")
         self._photo_ref = None
         self.set_status("停止")
+
+    def is_barcode_register_mode(self) -> bool:
+        """現在バーコード登録タブが選択されているか。"""
+        try:
+            return self.tabview.get() == "バーコード登録"
+        except Exception:
+            return False
 
     def set_status(self, text: str):
         self.status_var.set(text)
