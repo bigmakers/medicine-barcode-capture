@@ -50,8 +50,8 @@ GS1_DATABAR_FORMATS = {
 #  定数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RING_BUFFER_SEC = 2
-CAPTURE_INTERVAL_SEC = 2
-CAPTURE_COUNT = 10
+CAPTURE_INTERVAL_SEC = 1
+CAPTURE_COUNT = 5
 PREVIEW_MAX_W = 960
 PREVIEW_MAX_H = 540
 DEFAULT_BASE_DIR = str(Path.home() / "MedicineCaptures")
@@ -59,15 +59,11 @@ DB_NAME = "captures.db"
 
 # ── 動体検知パラメータ ──
 MOTION_AREA_RATIO = 0.005       # 画面面積のこの割合以上が変化 → 動体あり
-FRAME_DIFF_THRESHOLD = 3.0      # フレーム間差分の平均がこれ以下 → 静止
-STABLE_REQUIRED_FRAMES = 20     # 連続これだけ静止フレームが続けば「安定」
 MOTION_COOLDOWN_SEC = 3.0       # 撮影完了後、再検知を抑制する秒数
 
-# ── 動体検知ステートマシン ──
+# ── 動体検知ステート ──
 STATE_IDLE = "IDLE"             # 待機中（背景のみ、変化なし）
-STATE_MOTION = "MOTION"         # 動体検知中（何かが動いている）
-STATE_STABILIZING = "STABILIZING"  # 動体が止まりつつある
-STATE_READY = "READY"           # 安定 → バーコードスキャン実行
+STATE_TRIGGERED = "TRIGGERED"   # 動体検知 → ダイアログ表示中
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -166,6 +162,16 @@ class Database:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_captured_at ON captures(captured_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS barcode_registry (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    barcode    TEXT    NOT NULL UNIQUE,
+                    name       TEXT    NOT NULL,
+                    created_at TEXT    NOT NULL
+                )
+                """
+            )
 
     def insert(self, *, barcode, barcode_type, filename, filepath, captured_at, session_id):
         with sqlite3.connect(self.db_path) as conn:
@@ -176,6 +182,42 @@ class Database:
                 (barcode, barcode_type, filename, filepath, captured_at, session_id),
             )
 
+    # ── バーコード登録 ──
+    def register_barcode(self, barcode: str, name: str):
+        """バーコードと薬名を登録（既存なら更新）。"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO barcode_registry (barcode, name, created_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(barcode) DO UPDATE SET name=excluded.name, created_at=excluded.created_at",
+                (barcode, name, now),
+            )
+
+    def lookup_barcode(self, barcode: str):
+        """バーコードから薬名を検索。未登録なら None を返す。"""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT name FROM barcode_registry WHERE barcode = ?", (barcode,)
+            ).fetchone()
+            return row[0] if row else None
+
+    def get_all_registered(self):
+        """登録済みバーコード一覧を取得。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(
+                "SELECT * FROM barcode_registry ORDER BY created_at DESC"
+            ).fetchall()
+
+    def delete_barcode(self, barcode: str):
+        """バーコード登録を削除。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM barcode_registry WHERE barcode = ?", (barcode,)
+            )
+
+    # ── 撮影記録 ──
     def search_by_date(self, target_date: str):
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -232,15 +274,11 @@ class TTSWorker(threading.Thread):
 class CameraThread(threading.Thread):
     """カメラ映像取得・動体検知・バーコード読み上げを行うスレッド。
 
-    ステートマシン (撮影トリガー = 動体停止のみ):
-        IDLE  ──(画面に変化)──▶  MOTION
-        MOTION ──(動きが止まる)──▶  STABILIZING
-        STABILIZING ──(静止継続)──▶  READY → 登録ダイアログ表示
-        STABILIZING ──(再び動く)──▶  MOTION
-        READY ──(ダイアログ完了)──▶  IDLE
+    トリガー (動体検知時に即発火):
+        IDLE ──(背景変化あり)──▶ TRIGGERED → ダイアログ表示 → 撮影 → クールダウン → IDLE
 
     バーコード検知は撮影トリガーとは独立。
-    検知時はTTSで薬品名を読み上げるのみ。
+    検知時はTTSで薬品名（登録済みなら薬名）を読み上げるのみ。
     """
 
     def __init__(self, app: "App", camera_index: int = 0):
@@ -256,11 +294,8 @@ class CameraThread(threading.Thread):
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=50, detectShadows=False,
         )
-        self.prev_gray = None
         self.state = STATE_IDLE
-        self.stable_count = 0
         self.motion_area_ratio = 0.0   # デバッグ表示用
-        self.frame_diff = 0.0          # デバッグ表示用
 
         # ── 撮影制御 ──
         self.is_capturing = False
@@ -319,54 +354,33 @@ class CameraThread(threading.Thread):
             self.cap.release()
 
     # ──────────────────────────────────
-    #  ステートマシン
+    #  動体検知トリガー
     # ──────────────────────────────────
     def _step_state_machine(self, frame, display):
-        has_motion, is_still = self._analyze_motion(frame)
+        has_motion = self._detect_motion(frame)
 
         # ── 撮影後クールダウン中 ──
         if time.time() < self.cooldown_until:
             self.state = STATE_IDLE
             return
 
-        # ── IDLE: 変化待ち ──
+        # ── IDLE: 変化待ち → 動体検知で即ダイアログ ──
         if self.state == STATE_IDLE:
             if has_motion:
-                self.state = STATE_MOTION
-                self.stable_count = 0
+                self.state = STATE_TRIGGERED
+                self.dialog_shown = True
+                self.app.after(0, lambda: self.app.show_confirm_dialog())
 
-        # ── MOTION: 動いている ──
-        elif self.state == STATE_MOTION:
-            if is_still:
-                self.stable_count += 1
-                if self.stable_count >= STABLE_REQUIRED_FRAMES:
-                    self.state = STATE_STABILIZING
-            else:
-                self.stable_count = 0
-
-        # ── STABILIZING → READY: 動体が止まった → 登録ダイアログ ──
-        elif self.state == STATE_STABILIZING:
-            if has_motion:
-                self.state = STATE_MOTION
-                self.stable_count = 0
-                return
-
-            self.state = STATE_READY
-            self.dialog_shown = True
-            self.app.after(0, lambda: self.app.show_confirm_dialog())
-
-        # ── READY: ダイアログ表示中 ──
-        elif self.state == STATE_READY:
+        # ── TRIGGERED: ダイアログ表示中 ──
+        elif self.state == STATE_TRIGGERED:
             pass
 
-    def _analyze_motion(self, frame):
-        """背景差分 + フレーム間差分で動体を判定。
+    def _detect_motion(self, frame):
+        """背景差分 (MOG2) で動体を判定。
 
         Returns:
             has_motion: 背景と比較して有意な変化領域がある
-            is_still:   直前フレームとの差が小さい（物体が静止）
         """
-        # 背景差分 (MOG2) — 「何か新しいものがあるか」
         fg_mask = self.bg_subtractor.apply(frame, learningRate=0.005)
         # ノイズ除去
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -376,22 +390,7 @@ class CameraThread(threading.Thread):
         fg_pixels = np.count_nonzero(fg_mask)
         total_pixels = fg_mask.shape[0] * fg_mask.shape[1]
         self.motion_area_ratio = fg_pixels / total_pixels
-        has_motion = self.motion_area_ratio > MOTION_AREA_RATIO
-
-        # フレーム間差分 — 「今この瞬間動いているか」
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        if self.prev_gray is None:
-            self.prev_gray = gray
-            return has_motion, False
-
-        diff = cv2.absdiff(self.prev_gray, gray)
-        self.frame_diff = float(np.mean(diff))
-        self.prev_gray = gray
-
-        is_still = self.frame_diff < FRAME_DIFF_THRESHOLD
-        return has_motion, is_still
+        return self.motion_area_ratio > MOTION_AREA_RATIO
 
     # ──────────────────────────────────
     #  バーコード読み上げ（撮影トリガーとは独立）
@@ -399,7 +398,9 @@ class CameraThread(threading.Thread):
     BARCODE_TTS_COOLDOWN = 10.0  # 同一バーコードの再読み上げ抑制(秒)
 
     def _scan_barcode_for_tts(self, frame, display):
-        """バーコードを検出し、見つかったらTTSで読み上げる（撮影とは無関係）。"""
+        """バーコードを検出し、見つかったらTTSで読み上げる（撮影とは無関係）。
+        登録済みなら薬名を、未登録ならバーコードデータを読み上げる。
+        """
         now = time.time()
         if now < self.barcode_speak_cooldown:
             # クールダウン中でも検知結果は描画する
@@ -416,25 +417,50 @@ class CameraThread(threading.Thread):
         self.last_detected_barcode = bc
         self._draw_barcode(display, bc)
 
+        # バーコード登録タブの表示を更新
+        self.app.after(0, lambda d=bc["data"]: self.app._update_barcode_scan_display(d))
+
         # 同じバーコードは連続で読み上げない
         if bc["data"] != self.last_spoken_barcode:
             self.last_spoken_barcode = bc["data"]
             self.barcode_speak_cooldown = now + self.BARCODE_TTS_COOLDOWN
-            self.app.tts.speak(f"バーコード検知。{bc['data']}")
-            print(f"バーコード読み上げ: {bc['type']} — {bc['data']}")
+
+            # 登録済みなら薬名を読み上げ、未登録ならバーコードデータ
+            medicine_name = None
+            if self.app.db:
+                medicine_name = self.app.db.lookup_barcode(bc["data"])
+
+            if medicine_name:
+                self.app.tts.speak(medicine_name)
+                print(f"薬名読み上げ: {medicine_name} ({bc['type']} — {bc['data']})")
+            else:
+                self.app.tts.speak(f"バーコード検知。{bc['data']}")
+                print(f"バーコード読み上げ: {bc['type']} — {bc['data']}")
 
     def _draw_barcode(self, display, bc):
-        """バーコード枠とラベルを描画。"""
+        """バーコード枠とラベルを描画。登録済みなら薬名も表示。"""
         if bc["polygon"]:
             pts = np.array(bc["polygon"], dtype=np.int32)
             cv2.polylines(display, [pts], True, (0, 255, 0), 3)
         elif bc["rect"]:
             x, y, w, h = bc["rect"]
             cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
-        label = f'{bc["type"]}: {bc["data"][:40]}'
+
+        # 登録済み薬名があればラベルに表示
+        medicine_name = None
+        if self.app.db:
+            medicine_name = self.app.db.lookup_barcode(bc["data"])
+
+        if medicine_name:
+            label = f'{medicine_name} ({bc["type"]})'
+            color = (0, 255, 255)  # 黄色で登録済みを示す
+        else:
+            label = f'{bc["type"]}: {bc["data"][:40]}'
+            color = (0, 255, 0)
+
         cv2.putText(
             display, label, (10, 110),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
         )
 
     # ──────────────────────────────────
@@ -466,9 +492,7 @@ class CameraThread(threading.Thread):
             # ステート表示
             state_colors = {
                 STATE_IDLE: ((200, 200, 200), "IDLE"),
-                STATE_MOTION: ((0, 165, 255), "MOTION DETECTED"),
-                STATE_STABILIZING: ((0, 255, 255), "STABILIZING..."),
-                STATE_READY: ((0, 255, 0), "READY - SCANNING"),
+                STATE_TRIGGERED: ((0, 255, 0), "TRIGGERED"),
             }
             color, state_text = state_colors.get(self.state, ((255, 255, 255), self.state))
 
@@ -476,7 +500,7 @@ class CameraThread(threading.Thread):
 
         # デバッグ情報
         if not self.is_capturing:
-            info = f"BG:{self.motion_area_ratio:.4f}  DIFF:{self.frame_diff:.1f}  STABLE:{self.stable_count}"
+            info = f"BG:{self.motion_area_ratio:.4f}"
             cv2.putText(display, info, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
     # ──────────────────────────────────
@@ -502,7 +526,6 @@ class CameraThread(threading.Thread):
         self.dialog_shown = False
         self.cooldown_until = time.time() + MOTION_COOLDOWN_SEC
         self.state = STATE_IDLE
-        self.stable_count = 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -534,6 +557,9 @@ class App(ctk.CTk):
     def _init_db(self):
         os.makedirs(self.base_dir.get(), exist_ok=True)
         self.db = Database(self.base_dir.get())
+        # バーコード登録一覧を更新
+        if hasattr(self, "reg_list_frame"):
+            self._refresh_barcode_list()
 
     # ────────────────────────────────────
     #  UI 構築
@@ -543,6 +569,7 @@ class App(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 5))
 
         self._build_camera_tab()
+        self._build_barcode_tab()
         self._build_search_tab()
 
         self.status_var = ctk.StringVar(value="待機中")
@@ -590,6 +617,121 @@ class App(ctk.CTk):
         # プレビュー（tk.Label で高速な映像更新）
         self.preview = tk.Label(tab, bg="#1a1a1a", text="カメラ未接続", fg="gray")
         self.preview.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def _build_barcode_tab(self):
+        """バーコード登録タブを構築。"""
+        tab = self.tabview.add("バーコード登録")
+
+        # ── 上部: 検知バーコード表示 ──
+        scan_frame = ctk.CTkFrame(tab)
+        scan_frame.pack(fill="x", padx=5, pady=5)
+
+        ctk.CTkLabel(
+            scan_frame, text="バーコードをカメラに見せてください",
+            font=ctk.CTkFont(size=14),
+        ).pack(pady=(10, 5))
+
+        self.reg_barcode_var = ctk.StringVar(value="（スキャン待ち...）")
+        self.reg_barcode_label = ctk.CTkLabel(
+            scan_frame, textvariable=self.reg_barcode_var,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#3498db",
+        )
+        self.reg_barcode_label.pack(pady=5)
+
+        # ── 中央: 薬名入力 + 登録ボタン ──
+        input_frame = ctk.CTkFrame(tab)
+        input_frame.pack(fill="x", padx=5, pady=5)
+
+        ctk.CTkLabel(input_frame, text="薬名:").pack(side="left", padx=(10, 5))
+        self.reg_name_entry = ctk.CTkEntry(input_frame, width=300, placeholder_text="薬の名前を入力")
+        self.reg_name_entry.pack(side="left", padx=5)
+
+        self.btn_register = ctk.CTkButton(
+            input_frame, text="登録", width=100,
+            fg_color="#27ae60", hover_color="#219a52",
+            command=self._register_barcode,
+        )
+        self.btn_register.pack(side="left", padx=10)
+
+        # ── 下部: 登録済み一覧 ──
+        ctk.CTkLabel(
+            tab, text="登録済みバーコード一覧",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(10, 2))
+
+        self.reg_list_frame = ctk.CTkScrollableFrame(tab)
+        self.reg_list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # 内部状態: 登録タブで検知したバーコード
+        self._reg_scanned_barcode: str | None = None
+
+    def _register_barcode(self):
+        """バーコードと薬名をDBに登録する。"""
+        barcode = self._reg_scanned_barcode
+        name = self.reg_name_entry.get().strip()
+
+        if not barcode:
+            self.set_status("エラー: バーコードをスキャンしてください")
+            return
+        if not name:
+            self.set_status("エラー: 薬名を入力してください")
+            return
+
+        self.db.register_barcode(barcode, name)
+        self.tts.speak(f"{name}を登録しました")
+        self.set_status(f"登録完了: {barcode} → {name}")
+        self.reg_name_entry.delete(0, "end")
+        self._reg_scanned_barcode = None
+        self.reg_barcode_var.set("（スキャン待ち...）")
+        self._refresh_barcode_list()
+
+    def _refresh_barcode_list(self):
+        """登録済みバーコード一覧を更新する。"""
+        for w in self.reg_list_frame.winfo_children():
+            w.destroy()
+
+        if not self.db:
+            return
+
+        rows = self.db.get_all_registered()
+        if not rows:
+            ctk.CTkLabel(
+                self.reg_list_frame, text="登録データなし", text_color="gray"
+            ).pack(pady=20)
+            return
+
+        for row in rows:
+            rf = ctk.CTkFrame(self.reg_list_frame)
+            rf.pack(fill="x", padx=5, pady=2)
+
+            info = f"{row['barcode']}  →  {row['name']}"
+            ctk.CTkLabel(rf, text=info, anchor="w").pack(
+                side="left", padx=10, pady=5, fill="x", expand=True
+            )
+
+            bc = row["barcode"]
+            ctk.CTkButton(
+                rf, text="削除", width=50,
+                fg_color="#e74c3c", hover_color="#c0392b",
+                command=lambda b=bc: self._delete_barcode(b),
+            ).pack(side="right", padx=5, pady=5)
+
+    def _delete_barcode(self, barcode: str):
+        """バーコード登録を削除する。"""
+        self.db.delete_barcode(barcode)
+        self.set_status(f"削除: {barcode}")
+        self._refresh_barcode_list()
+
+    def _update_barcode_scan_display(self, barcode_data: str):
+        """バーコード登録タブのスキャン表示を更新（メインスレッドから呼ぶ）。"""
+        self._reg_scanned_barcode = barcode_data
+        # 登録済みか確認して表示に反映
+        existing = self.db.lookup_barcode(barcode_data) if self.db else None
+        if existing:
+            self.reg_barcode_var.set(f"{barcode_data} （登録済み: {existing}）")
+        else:
+            self.reg_barcode_var.set(barcode_data)
 
     def _build_search_tab(self):
         tab = self.tabview.add("検索")
@@ -702,7 +844,7 @@ class App(ctk.CTk):
     #  確認ダイアログ & 撮影シーケンス
     # ────────────────────────────────────
     def show_confirm_dialog(self):
-        """動体停止時の登録確認ダイアログ（バーコード不要）。"""
+        """動体検知時の登録確認ダイアログ。"""
         dialog = ctk.CTkToplevel(self)
         dialog.title("物体検知")
         dialog.geometry("400x180")
