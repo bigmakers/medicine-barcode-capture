@@ -230,14 +230,17 @@ class TTSWorker(threading.Thread):
 #  カメラスレッド
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class CameraThread(threading.Thread):
-    """カメラ映像取得・動体検知・バーコード検出を行うスレッド。
+    """カメラ映像取得・動体検知・バーコード読み上げを行うスレッド。
 
-    ステートマシン:
+    ステートマシン (撮影トリガー = 動体停止のみ):
         IDLE  ──(画面に変化)──▶  MOTION
         MOTION ──(動きが止まる)──▶  STABILIZING
-        STABILIZING ──(一定フレーム静止継続)──▶  READY (バーコードスキャン)
+        STABILIZING ──(静止継続)──▶  READY → 登録ダイアログ表示
         STABILIZING ──(再び動く)──▶  MOTION
-        READY ──(スキャン完了)──▶  IDLE
+        READY ──(ダイアログ完了)──▶  IDLE
+
+    バーコード検知は撮影トリガーとは独立。
+    検知時はTTSで薬品名を読み上げるのみ。
     """
 
     def __init__(self, app: "App", camera_index: int = 0):
@@ -264,6 +267,11 @@ class CameraThread(threading.Thread):
         self.capture_progress = 0
         self.dialog_shown = False
         self.cooldown_until = 0.0      # 撮影後の再検知抑制
+
+        # ── バーコード読み上げ（撮影とは独立） ──
+        self.last_spoken_barcode: str | None = None
+        self.barcode_speak_cooldown = 0.0
+        self.last_detected_barcode: dict | None = None  # 直近の検知結果
 
     # ──────────────────────────────────
     #  メインループ
@@ -299,6 +307,9 @@ class CameraThread(threading.Thread):
             if not self.is_capturing and not self.dialog_shown:
                 self._step_state_machine(frame, display)
 
+            # バーコード読み上げ（撮影トリガーとは独立）
+            self._scan_barcode_for_tts(frame, display)
+
             self._draw_overlay(display)
             self.app.after(0, lambda f=display: self.app.update_preview(f))
 
@@ -333,45 +344,20 @@ class CameraThread(threading.Thread):
             else:
                 self.stable_count = 0
 
-        # ── STABILIZING → READY: バーコードスキャン ──
+        # ── STABILIZING → READY: 動体が止まった → 登録ダイアログ ──
         elif self.state == STATE_STABILIZING:
             if has_motion:
-                # また動き出した → MOTION に戻る
                 self.state = STATE_MOTION
                 self.stable_count = 0
                 return
 
             self.state = STATE_READY
-            barcodes = decode_barcodes(frame)
+            self.dialog_shown = True
+            self.app.after(0, lambda: self.app.show_confirm_dialog())
 
-            # バーコード枠を描画
-            for bc in barcodes:
-                if bc["polygon"]:
-                    pts = np.array(bc["polygon"], dtype=np.int32)
-                    cv2.polylines(display, [pts], True, (0, 255, 0), 3)
-                elif bc["rect"]:
-                    x, y, w, h = bc["rect"]
-                    cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                label = f'{bc["type"]}: {bc["data"][:40]}'
-                cv2.putText(
-                    display, label, (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                )
-
-            if barcodes:
-                bc = barcodes[0]
-                self.dialog_shown = True
-                self.app.after(
-                    0,
-                    lambda d=bc["data"], t=bc["type"]: self.app.show_confirm_dialog(d, t),
-                )
-            else:
-                # バーコードなし → IDLE に戻り次の動体を待つ
-                self.state = STATE_IDLE
-
-        # ── READY: ダイアログ表示中 or 処理待ち ──
+        # ── READY: ダイアログ表示中 ──
         elif self.state == STATE_READY:
-            pass  # dialog_shown フラグで制御される
+            pass
 
     def _analyze_motion(self, frame):
         """背景差分 + フレーム間差分で動体を判定。
@@ -406,6 +392,50 @@ class CameraThread(threading.Thread):
 
         is_still = self.frame_diff < FRAME_DIFF_THRESHOLD
         return has_motion, is_still
+
+    # ──────────────────────────────────
+    #  バーコード読み上げ（撮影トリガーとは独立）
+    # ──────────────────────────────────
+    BARCODE_TTS_COOLDOWN = 10.0  # 同一バーコードの再読み上げ抑制(秒)
+
+    def _scan_barcode_for_tts(self, frame, display):
+        """バーコードを検出し、見つかったらTTSで読み上げる（撮影とは無関係）。"""
+        now = time.time()
+        if now < self.barcode_speak_cooldown:
+            # クールダウン中でも検知結果は描画する
+            if self.last_detected_barcode:
+                self._draw_barcode(display, self.last_detected_barcode)
+            return
+
+        barcodes = decode_barcodes(frame)
+        if not barcodes:
+            self.last_detected_barcode = None
+            return
+
+        bc = barcodes[0]
+        self.last_detected_barcode = bc
+        self._draw_barcode(display, bc)
+
+        # 同じバーコードは連続で読み上げない
+        if bc["data"] != self.last_spoken_barcode:
+            self.last_spoken_barcode = bc["data"]
+            self.barcode_speak_cooldown = now + self.BARCODE_TTS_COOLDOWN
+            self.app.tts.speak(f"バーコード検知。{bc['data']}")
+            print(f"バーコード読み上げ: {bc['type']} — {bc['data']}")
+
+    def _draw_barcode(self, display, bc):
+        """バーコード枠とラベルを描画。"""
+        if bc["polygon"]:
+            pts = np.array(bc["polygon"], dtype=np.int32)
+            cv2.polylines(display, [pts], True, (0, 255, 0), 3)
+        elif bc["rect"]:
+            x, y, w, h = bc["rect"]
+            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
+        label = f'{bc["type"]}: {bc["data"][:40]}'
+        cv2.putText(
+            display, label, (10, 110),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+        )
 
     # ──────────────────────────────────
     #  オーバーレイ描画
@@ -537,9 +567,23 @@ class App(ctk.CTk):
         )
         self.btn_stop.pack(side="left", padx=5)
 
-        ctk.CTkLabel(ctrl, text="保存先:").pack(side="left", padx=(20, 2))
-        ctk.CTkEntry(ctrl, textvariable=self.base_dir, width=300).pack(side="left", padx=2)
-        ctk.CTkButton(ctrl, text="参照", width=50, command=self._browse_dir).pack(
+        self.btn_test = ctk.CTkButton(
+            ctrl, text="テスト撮影", width=100,
+            fg_color="#e67e22", hover_color="#d35400",
+            command=self.test_capture, state="disabled",
+        )
+        self.btn_test.pack(side="left", padx=5)
+
+        # 2段目: 保存先
+        ctrl2 = ctk.CTkFrame(tab)
+        ctrl2.pack(fill="x", padx=5, pady=(0, 5))
+
+        ctk.CTkLabel(ctrl2, text="保存先:").pack(side="left", padx=(10, 2))
+        ctk.CTkEntry(ctrl2, textvariable=self.base_dir, width=400).pack(side="left", padx=2)
+        ctk.CTkButton(ctrl2, text="参照", width=50, command=self._browse_dir).pack(
+            side="left", padx=5
+        )
+        ctk.CTkButton(ctrl2, text="フォルダを開く", width=100, command=self._open_save_dir).pack(
             side="left", padx=5
         )
 
@@ -577,6 +621,7 @@ class App(ctk.CTk):
         self.camera_thread.start()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
+        self.btn_test.configure(state="normal")
         self.set_status("カメラ起動中...")
 
     def stop_camera(self):
@@ -585,6 +630,7 @@ class App(ctk.CTk):
             self.camera_thread = None
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        self.btn_test.configure(state="disabled")
         self.preview.configure(image="", text="カメラ未接続")
         self._photo_ref = None
         self.set_status("停止")
@@ -611,37 +657,76 @@ class App(ctk.CTk):
             self.base_dir.set(d)
             self._init_db()
 
+    def _open_save_dir(self):
+        """保存先フォルダを OS のファイルマネージャで開く。"""
+        d = self.base_dir.get()
+        os.makedirs(d, exist_ok=True)
+        open_file(d)
+
+    def test_capture(self):
+        """テスト撮影: バーコード検知なしで現在のフレームを1枚保存する。"""
+        if not self.camera_thread or not self.camera_thread.ring_buffer:
+            self.set_status("エラー: カメラが起動していません")
+            return
+
+        self._init_db()
+        now = datetime.now()
+        date_dir = now.strftime("%Y-%m-%d")
+        save_dir = os.path.join(self.base_dir.get(), date_dir)
+        os.makedirs(save_dir, exist_ok=True)
+
+        frame, ts = self.camera_thread.get_current_frame()
+        if frame is None:
+            self.set_status("エラー: フレームを取得できませんでした")
+            return
+
+        ts = ts or now
+        filename = f"{ts.strftime('%Y%m%d_%H%M%S')}_test.jpg"
+        filepath = os.path.join(save_dir, filename)
+
+        if save_frame_as_jpg(filepath, frame):
+            self.db.insert(
+                barcode="TEST",
+                barcode_type="TEST",
+                filename=filename,
+                filepath=filepath,
+                captured_at=ts.strftime("%Y-%m-%d %H:%M:%S"),
+                session_id=f"test_{ts.strftime('%Y%m%d_%H%M%S')}",
+            )
+            self.set_status(f"テスト撮影完了: {filepath}")
+            self.tts.speak("テスト撮影完了")
+        else:
+            self.set_status(f"エラー: テスト撮影の保存に失敗しました")
+
     # ────────────────────────────────────
     #  確認ダイアログ & 撮影シーケンス
     # ────────────────────────────────────
-    def show_confirm_dialog(self, barcode_data: str, barcode_type: str):
+    def show_confirm_dialog(self):
+        """動体停止時の登録確認ダイアログ（バーコード不要）。"""
         dialog = ctk.CTkToplevel(self)
-        dialog.title("バーコード検知")
-        dialog.geometry("450x230")
+        dialog.title("物体検知")
+        dialog.geometry("400x180")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
 
         dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 450) // 2
-        y = self.winfo_y() + (self.winfo_height() - 230) // 2
+        x = self.winfo_x() + (self.winfo_width() - 400) // 2
+        y = self.winfo_y() + (self.winfo_height() - 180) // 2
         dialog.geometry(f"+{x}+{y}")
 
         ctk.CTkLabel(
-            dialog, text="バーコードを検知しました",
+            dialog, text="物体を検知しました",
             font=ctk.CTkFont(size=18, weight="bold"),
         ).pack(pady=(20, 10))
-        ctk.CTkLabel(dialog, text=f"種類: {barcode_type}").pack()
-        display_data = barcode_data if len(barcode_data) <= 50 else barcode_data[:50] + "..."
-        ctk.CTkLabel(dialog, text=f"データ: {display_data}").pack(pady=5)
-        ctk.CTkLabel(dialog, text="登録しますか？", font=ctk.CTkFont(size=14)).pack(pady=5)
+        ctk.CTkLabel(dialog, text="登録しますか？", font=ctk.CTkFont(size=14)).pack(pady=10)
 
         btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_frame.pack(pady=10)
 
         def on_register():
             dialog.destroy()
-            self._start_capture(barcode_data, barcode_type)
+            self._start_capture()
 
         def on_cancel():
             dialog.destroy()
@@ -657,29 +742,49 @@ class App(ctk.CTk):
 
         dialog.protocol("WM_DELETE_WINDOW", on_cancel)
 
-    def _start_capture(self, barcode_data: str, barcode_type: str):
+    def _start_capture(self):
         if self.camera_thread:
             self.camera_thread.is_capturing = True
             self.camera_thread.capture_progress = 0
         threading.Thread(
             target=self._capture_sequence,
-            args=(barcode_data, barcode_type),
             daemon=True,
         ).start()
 
-    def _capture_sequence(self, barcode_data: str, barcode_type: str):
+    def _capture_sequence(self):
+        try:
+            self._do_capture()
+        except Exception as e:
+            print(f"撮影シーケンスでエラー: {e}")
+            import traceback
+            traceback.print_exc()
+            self.after(0, lambda: self.set_status(f"エラー: {e}"))
+        finally:
+            if self.camera_thread:
+                self.camera_thread.is_capturing = False
+                self.camera_thread.capture_progress = 0
+                self.camera_thread.reset_for_next()
+
+    def _do_capture(self):
         now = datetime.now()
         session_id = now.strftime("%Y%m%d_%H%M%S")
         date_dir = now.strftime("%Y-%m-%d")
         save_dir = os.path.join(self.base_dir.get(), date_dir)
         os.makedirs(save_dir, exist_ok=True)
 
-        self.after(0, lambda: self.set_status(f"撮影中 0/{CAPTURE_COUNT} — {barcode_data}"))
+        # 直近のバーコード検知結果があれば DB に記録用に取得
+        barcode_data = "N/A"
+        barcode_type = "N/A"
+        if self.camera_thread and self.camera_thread.last_detected_barcode:
+            bc = self.camera_thread.last_detected_barcode
+            barcode_data = bc["data"]
+            barcode_type = bc["type"]
+
+        self.after(0, lambda: self.set_status(f"撮影中 0/{CAPTURE_COUNT}"))
         saved_count = 0
 
         for i in range(CAPTURE_COUNT):
             if i == 0:
-                # リングバッファの最古フレーム（≒2秒前）
                 frame, ts = (
                     self.camera_thread.get_buffer_frame()
                     if self.camera_thread
@@ -719,20 +824,14 @@ class App(ctk.CTk):
                 self.camera_thread.capture_progress = count
             self.after(
                 0,
-                lambda c=count: self.set_status(f"撮影中 {c}/{CAPTURE_COUNT} — {barcode_data}"),
+                lambda c=count: self.set_status(f"撮影中 {c}/{CAPTURE_COUNT}"),
             )
 
-        # 撮影完了 → クールダウン付きリセット
-        if self.camera_thread:
-            self.camera_thread.is_capturing = False
-            self.camera_thread.capture_progress = 0
-            self.camera_thread.reset_for_next()
-
-        msg = f"撮影完了: {saved_count}/{CAPTURE_COUNT}枚保存 ({barcode_data})"
+        msg = f"撮影完了: {saved_count}/{CAPTURE_COUNT}枚保存"
         self.after(0, lambda: self.set_status(msg))
         print(msg)
         print(f"保存先: {save_dir}")
-        self.tts.speak(f"登録完了。{saved_count}枚保存しました。バーコード {barcode_data}")
+        self.tts.speak(f"登録完了。{saved_count}枚保存しました")
 
     # ────────────────────────────────────
     #  検索
