@@ -52,12 +52,22 @@ GS1_DATABAR_FORMATS = {
 RING_BUFFER_SEC = 2
 CAPTURE_INTERVAL_SEC = 2
 CAPTURE_COUNT = 10
-MOTION_THRESHOLD = 5.0
-MOTION_STABLE_FRAMES = 15
 PREVIEW_MAX_W = 960
 PREVIEW_MAX_H = 540
 DEFAULT_BASE_DIR = str(Path.home() / "MedicineCaptures")
 DB_NAME = "captures.db"
+
+# ── 動体検知パラメータ ──
+MOTION_AREA_RATIO = 0.005       # 画面面積のこの割合以上が変化 → 動体あり
+FRAME_DIFF_THRESHOLD = 3.0      # フレーム間差分の平均がこれ以下 → 静止
+STABLE_REQUIRED_FRAMES = 20     # 連続これだけ静止フレームが続けば「安定」
+MOTION_COOLDOWN_SEC = 3.0       # 撮影完了後、再検知を抑制する秒数
+
+# ── 動体検知ステートマシン ──
+STATE_IDLE = "IDLE"             # 待機中（背景のみ、変化なし）
+STATE_MOTION = "MOTION"         # 動体検知中（何かが動いている）
+STATE_STABILIZING = "STABILIZING"  # 動体が止まりつつある
+STATE_READY = "READY"           # 安定 → バーコードスキャン実行
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -205,7 +215,15 @@ class TTSWorker(threading.Thread):
 #  カメラスレッド
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class CameraThread(threading.Thread):
-    """カメラ映像取得・動体検知・バーコード検出を行うスレッド。"""
+    """カメラ映像取得・動体検知・バーコード検出を行うスレッド。
+
+    ステートマシン:
+        IDLE  ──(画面に変化)──▶  MOTION
+        MOTION ──(動きが止まる)──▶  STABILIZING
+        STABILIZING ──(一定フレーム静止継続)──▶  READY (バーコードスキャン)
+        STABILIZING ──(再び動く)──▶  MOTION
+        READY ──(スキャン完了)──▶  IDLE
+    """
 
     def __init__(self, app: "App", camera_index: int = 0):
         super().__init__(daemon=True)
@@ -216,17 +234,25 @@ class CameraThread(threading.Thread):
         self.fps = 30
         self.ring_buffer: deque = deque(maxlen=RING_BUFFER_SEC * self.fps)
 
-        # 動体検知用
+        # ── 動体検知 ──
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=50, detectShadows=False,
+        )
         self.prev_gray = None
+        self.state = STATE_IDLE
         self.stable_count = 0
+        self.motion_area_ratio = 0.0   # デバッグ表示用
+        self.frame_diff = 0.0          # デバッグ表示用
 
-        # 状態フラグ
+        # ── 撮影制御 ──
         self.is_capturing = False
         self.capture_progress = 0
-        self.last_barcode: str | None = None
         self.dialog_shown = False
+        self.cooldown_until = 0.0      # 撮影後の再検知抑制
 
-    # ── メインループ ──
+    # ──────────────────────────────────
+    #  メインループ
+    # ──────────────────────────────────
     def run(self):
         self.cap = cv2.VideoCapture(self.camera_index)
         if not self.cap.isOpened():
@@ -256,7 +282,7 @@ class CameraThread(threading.Thread):
             display = frame.copy()
 
             if not self.is_capturing and not self.dialog_shown:
-                self._detect(frame, display)
+                self._step_state_machine(frame, display)
 
             self._draw_overlay(display)
             self.app.after(0, lambda f=display: self.app.update_preview(f))
@@ -266,60 +292,115 @@ class CameraThread(threading.Thread):
         if self.cap:
             self.cap.release()
 
-    # ── 検知処理 ──
-    def _detect(self, frame, display):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+    # ──────────────────────────────────
+    #  ステートマシン
+    # ──────────────────────────────────
+    def _step_state_machine(self, frame, display):
+        has_motion, is_still = self._analyze_motion(frame)
 
-        if self.prev_gray is None:
-            self.prev_gray = gray
+        # ── 撮影後クールダウン中 ──
+        if time.time() < self.cooldown_until:
+            self.state = STATE_IDLE
             return
 
-        diff = cv2.absdiff(self.prev_gray, gray)
-        mean_diff = np.mean(diff)
-        self.prev_gray = gray
+        # ── IDLE: 変化待ち ──
+        if self.state == STATE_IDLE:
+            if has_motion:
+                self.state = STATE_MOTION
+                self.stable_count = 0
 
-        if mean_diff < MOTION_THRESHOLD:
-            self.stable_count += 1
-        else:
-            self.stable_count = 0
+        # ── MOTION: 動いている ──
+        elif self.state == STATE_MOTION:
+            if is_still:
+                self.stable_count += 1
+                if self.stable_count >= STABLE_REQUIRED_FRAMES:
+                    self.state = STATE_STABILIZING
+            else:
+                self.stable_count = 0
 
-        if self.stable_count < MOTION_STABLE_FRAMES:
-            return
+        # ── STABILIZING → READY: バーコードスキャン ──
+        elif self.state == STATE_STABILIZING:
+            if has_motion:
+                # また動き出した → MOTION に戻る
+                self.state = STATE_MOTION
+                self.stable_count = 0
+                return
 
-        barcodes = decode_barcodes(frame)
+            self.state = STATE_READY
+            barcodes = decode_barcodes(frame)
 
-        for bc in barcodes:
-            if bc["polygon"]:
-                pts = np.array(bc["polygon"], dtype=np.int32)
-                cv2.polylines(display, [pts], True, (0, 255, 0), 3)
-            elif bc["rect"]:
-                x, y, w, h = bc["rect"]
-                cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
-            label = f'{bc["type"]}: {bc["data"][:40]}'
-            cv2.putText(
-                display, label, (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-            )
+            # バーコード枠を描画
+            for bc in barcodes:
+                if bc["polygon"]:
+                    pts = np.array(bc["polygon"], dtype=np.int32)
+                    cv2.polylines(display, [pts], True, (0, 255, 0), 3)
+                elif bc["rect"]:
+                    x, y, w, h = bc["rect"]
+                    cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                label = f'{bc["type"]}: {bc["data"][:40]}'
+                cv2.putText(
+                    display, label, (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                )
 
-        if barcodes:
-            bc = barcodes[0]
-            if bc["data"] != self.last_barcode:
-                self.last_barcode = bc["data"]
+            if barcodes:
+                bc = barcodes[0]
                 self.dialog_shown = True
                 self.app.after(
                     0,
                     lambda d=bc["data"], t=bc["type"]: self.app.show_confirm_dialog(d, t),
                 )
+            else:
+                # バーコードなし → IDLE に戻り次の動体を待つ
+                self.state = STATE_IDLE
 
-    # ── オーバーレイ描画 ──
+        # ── READY: ダイアログ表示中 or 処理待ち ──
+        elif self.state == STATE_READY:
+            pass  # dialog_shown フラグで制御される
+
+    def _analyze_motion(self, frame):
+        """背景差分 + フレーム間差分で動体を判定。
+
+        Returns:
+            has_motion: 背景と比較して有意な変化領域がある
+            is_still:   直前フレームとの差が小さい（物体が静止）
+        """
+        # 背景差分 (MOG2) — 「何か新しいものがあるか」
+        fg_mask = self.bg_subtractor.apply(frame, learningRate=0.005)
+        # ノイズ除去
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+
+        fg_pixels = np.count_nonzero(fg_mask)
+        total_pixels = fg_mask.shape[0] * fg_mask.shape[1]
+        self.motion_area_ratio = fg_pixels / total_pixels
+        has_motion = self.motion_area_ratio > MOTION_AREA_RATIO
+
+        # フレーム間差分 — 「今この瞬間動いているか」
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return has_motion, False
+
+        diff = cv2.absdiff(self.prev_gray, gray)
+        self.frame_diff = float(np.mean(diff))
+        self.prev_gray = gray
+
+        is_still = self.frame_diff < FRAME_DIFF_THRESHOLD
+        return has_motion, is_still
+
+    # ──────────────────────────────────
+    #  オーバーレイ描画
+    # ──────────────────────────────────
     def _draw_overlay(self, display):
         h, w = display.shape[:2]
 
         if self.is_capturing:
-            status = f"CAPTURING {self.capture_progress}/{CAPTURE_COUNT}"
+            state_text = f"CAPTURING {self.capture_progress}/{CAPTURE_COUNT}"
             color = (0, 0, 255)
-            # プログレスバー
             if self.capture_progress > 0:
                 bar_w = int(w * 0.5)
                 bar_x = (w - bar_w) // 2
@@ -327,25 +408,35 @@ class CameraThread(threading.Thread):
                 progress = self.capture_progress / CAPTURE_COUNT
                 cv2.rectangle(display, (bar_x, bar_y), (bar_x + bar_w, bar_y + 20), (50, 50, 50), -1)
                 cv2.rectangle(
-                    display,
-                    (bar_x, bar_y),
+                    display, (bar_x, bar_y),
                     (bar_x + int(bar_w * progress), bar_y + 20),
-                    (0, 200, 0),
-                    -1,
+                    (0, 200, 0), -1,
                 )
                 cv2.putText(
-                    display,
-                    f"{self.capture_progress}/{CAPTURE_COUNT}",
+                    display, f"{self.capture_progress}/{CAPTURE_COUNT}",
                     (bar_x + bar_w + 10, bar_y + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
                 )
         else:
-            status = "MONITORING"
-            color = (0, 255, 0)
+            # ステート表示
+            state_colors = {
+                STATE_IDLE: ((200, 200, 200), "IDLE"),
+                STATE_MOTION: ((0, 165, 255), "MOTION DETECTED"),
+                STATE_STABILIZING: ((0, 255, 255), "STABILIZING..."),
+                STATE_READY: ((0, 255, 0), "READY - SCANNING"),
+            }
+            color, state_text = state_colors.get(self.state, ((255, 255, 255), self.state))
 
-        cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(display, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-    # ── バッファアクセス ──
+        # デバッグ情報
+        if not self.is_capturing:
+            info = f"BG:{self.motion_area_ratio:.4f}  DIFF:{self.frame_diff:.1f}  STABLE:{self.stable_count}"
+            cv2.putText(display, info, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+    # ──────────────────────────────────
+    #  バッファアクセス
+    # ──────────────────────────────────
     def get_buffer_frame(self):
         """リングバッファ最古フレーム（≒2秒前）を返す。"""
         if self.ring_buffer:
@@ -360,6 +451,13 @@ class CameraThread(threading.Thread):
 
     def stop(self):
         self.running = False
+
+    def reset_for_next(self):
+        """撮影完了後のリセット。クールダウン付きで IDLE に戻す。"""
+        self.dialog_shown = False
+        self.cooldown_until = time.time() + MOTION_COOLDOWN_SEC
+        self.state = STATE_IDLE
+        self.stable_count = 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -533,8 +631,7 @@ class App(ctk.CTk):
         def on_cancel():
             dialog.destroy()
             if self.camera_thread:
-                self.camera_thread.dialog_shown = False
-                self.camera_thread.last_barcode = None
+                self.camera_thread.reset_for_next()
 
         ctk.CTkButton(btn_frame, text="登録する", width=120, command=on_register).pack(
             side="left", padx=10
@@ -607,12 +704,11 @@ class App(ctk.CTk):
                 lambda c=count: self.set_status(f"撮影中 {c}/{CAPTURE_COUNT} — {barcode_data}"),
             )
 
-        # 撮影完了
+        # 撮影完了 → クールダウン付きリセット
         if self.camera_thread:
             self.camera_thread.is_capturing = False
             self.camera_thread.capture_progress = 0
-            self.camera_thread.dialog_shown = False
-            self.camera_thread.last_barcode = None
+            self.camera_thread.reset_for_next()
 
         self.after(
             0, lambda: self.set_status(f"撮影完了: {CAPTURE_COUNT}枚保存 ({barcode_data})")
