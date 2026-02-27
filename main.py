@@ -487,30 +487,52 @@ class CameraThread(threading.Thread):
     #  計数モード処理
     # ──────────────────────────────────
     def _process_pill_counting(self, frame):
-        """黒背景上の錠剤を計数し、輪郭・番号を描画したフレームを返す。"""
+        """黒背景上の錠剤を計数し、輪郭・番号を描画したフレームを返す。
+        距離変換＋ウォーターシェッドで接触した錠剤を分離する。
+        """
         display = frame.copy()
         threshold = self.app.pill_threshold_var.get()
 
-        # 1. グレースケール → ぼかし
+        # 1. グレースケール → ぼかし → 二値化
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (PILL_BLUR_KSIZE, PILL_BLUR_KSIZE), 0)
-
-        # 2. 二値化（黒背景 → 錠剤は明るい）
         _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
 
-        # 3. モルフォロジー処理（ノイズ除去）
+        # 2. モルフォロジー（ノイズ除去）
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # 4. 輪郭検出
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 3. 距離変換＋ウォーターシェッドで接触錠剤を分離
+        dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dist, 0.45 * dist.max(), 255, cv2.THRESH_BINARY)
+        sure_fg = sure_fg.astype(np.uint8)
 
-        # 5. フィルタリング + 形状分類
+        # 確実な背景（膨張で前景の外側）
+        sure_bg = cv2.dilate(binary, kernel, iterations=3)
+        unknown = cv2.subtract(sure_bg, sure_fg)
+
+        # マーカー生成
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers = markers + 1           # 背景を1に
+        markers[unknown == 255] = 0     # 未知領域を0に
+
+        # ウォーターシェッド実行
+        ws_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        cv2.watershed(ws_input, markers)
+
+        # 4. 各ラベルの輪郭を取得して分類
         shape_counts = {"丸": 0, "楕円": 0, "カプセル": 0}
         pill_num = 0
+        num_labels = markers.max()
 
-        for cnt in contours:
+        for label_id in range(2, num_labels + 1):  # 0=未知, 1=背景, 2~=前景
+            mask = np.uint8(markers == label_id) * 255
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+
             area = cv2.contourArea(cnt)
             if area < PILL_MIN_AREA or area > PILL_MAX_AREA:
                 continue
@@ -519,13 +541,12 @@ class CameraThread(threading.Thread):
             perimeter = cv2.arcLength(cnt, True)
 
             # 形状分類
-            shape = "楕円"  # デフォルト
+            shape = "楕円"
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
                 if circularity > PILL_CIRCULARITY_ROUND:
                     shape = "丸"
 
-            # アスペクト比でカプセル判定
             if len(cnt) >= 5:
                 ellipse = cv2.fitEllipse(cnt)
                 (_, _), (ma, MA), _ = ellipse
