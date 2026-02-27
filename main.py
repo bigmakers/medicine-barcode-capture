@@ -63,6 +63,14 @@ CONFIG_PATH = str(Path.home() / ".medicine_capture_config.json")
 MOTION_AREA_RATIO = 0.005       # 画面面積のこの割合以上が変化 → 動体あり
 MOTION_COOLDOWN_SEC = 3.0       # 撮影完了後、再検知を抑制する秒数
 
+# ── 計数モードパラメータ ──
+PILL_THRESH_DEFAULT = 60        # 二値化しきい値デフォルト
+PILL_MIN_AREA = 300             # 輪郭面積の最小（ノイズ除去）
+PILL_MAX_AREA = 50000           # 輪郭面積の最大（手等を除外）
+PILL_BLUR_KSIZE = 7             # ガウシアンぼかしカーネル
+PILL_CIRCULARITY_ROUND = 0.80   # 円形度がこれ以上 → 丸
+PILL_ASPECT_CAPSULE = 2.0       # アスペクト比がこれ以上 → カプセル
+
 # ── 動体検知ステート ──
 STATE_IDLE = "IDLE"             # 待機中（背景のみ、変化なし）
 STATE_TRIGGERED = "TRIGGERED"   # 動体検知 → ダイアログ表示中
@@ -338,6 +346,14 @@ class CameraThread(threading.Thread):
             timestamp = datetime.now()
             self.ring_buffer.append((frame.copy(), timestamp))
 
+            # ── 計数モード ──
+            if self.app.is_counting_mode():
+                display, count, shapes = self._process_pill_counting(frame)
+                self.app.after(0, lambda d=display: self.app.update_counting_preview(d))
+                self.app.after(0, lambda c=count, s=shapes: self.app._update_pill_count(c, s))
+                time.sleep(1.0 / self.fps)
+                continue
+
             display = frame.copy()
 
             if not self.is_capturing and not self.app.is_barcode_register_mode():
@@ -468,6 +484,84 @@ class CameraThread(threading.Thread):
         )
 
     # ──────────────────────────────────
+    #  計数モード処理
+    # ──────────────────────────────────
+    def _process_pill_counting(self, frame):
+        """黒背景上の錠剤を計数し、輪郭・番号を描画したフレームを返す。"""
+        display = frame.copy()
+        threshold = self.app.pill_threshold_var.get()
+
+        # 1. グレースケール → ぼかし
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (PILL_BLUR_KSIZE, PILL_BLUR_KSIZE), 0)
+
+        # 2. 二値化（黒背景 → 錠剤は明るい）
+        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+
+        # 3. モルフォロジー処理（ノイズ除去）
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # 4. 輪郭検出
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 5. フィルタリング + 形状分類
+        shape_counts = {"丸": 0, "楕円": 0, "カプセル": 0}
+        pill_num = 0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < PILL_MIN_AREA or area > PILL_MAX_AREA:
+                continue
+
+            pill_num += 1
+            perimeter = cv2.arcLength(cnt, True)
+
+            # 形状分類
+            shape = "楕円"  # デフォルト
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                if circularity > PILL_CIRCULARITY_ROUND:
+                    shape = "丸"
+
+            # アスペクト比でカプセル判定
+            if len(cnt) >= 5:
+                ellipse = cv2.fitEllipse(cnt)
+                (_, _), (ma, MA), _ = ellipse
+                aspect_ratio = max(ma, MA) / (min(ma, MA) + 1e-6)
+                if aspect_ratio > PILL_ASPECT_CAPSULE:
+                    shape = "カプセル"
+
+            shape_counts[shape] += 1
+
+            # 描画: 輪郭（色分け）
+            color = {
+                "丸": (0, 255, 0),
+                "楕円": (255, 200, 0),
+                "カプセル": (0, 200, 255),
+            }[shape]
+            cv2.drawContours(display, [cnt], -1, color, 2)
+
+            # 番号を重心に描画
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                cv2.putText(
+                    display, str(pill_num), (cx - 10, cy + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                )
+
+        # 合計をオーバーレイ
+        cv2.putText(
+            display, f"COUNT: {pill_num}", (10, 40),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 128), 3,
+        )
+
+        return display, pill_num, shape_counts
+
+    # ──────────────────────────────────
     #  オーバーレイ描画
     # ──────────────────────────────────
     def _draw_overlay(self, display):
@@ -554,6 +648,7 @@ class App(ctk.CTk):
         self.tts.start()
         self.db: Database | None = None
         self._photo_ref = None  # PhotoImage の参照保持（GC防止）
+        self._counting_photo_ref = None  # 計数プレビュー用
 
         self._build_ui()
         self._init_db()
@@ -594,6 +689,7 @@ class App(ctk.CTk):
 
         self._build_camera_tab()
         self._build_barcode_tab()
+        self._build_counting_tab()
         self._build_search_tab()
 
         self.status_var = ctk.StringVar(value="待機中")
@@ -777,6 +873,51 @@ class App(ctk.CTk):
         else:
             self.reg_barcode_var.set(barcode_data)
 
+    def _build_counting_tab(self):
+        """計数モードタブを構築。"""
+        tab = self.tabview.add("計数")
+
+        # ── 上部: しきい値スライダー ──
+        ctrl = ctk.CTkFrame(tab)
+        ctrl.pack(fill="x", padx=5, pady=5)
+
+        ctk.CTkLabel(ctrl, text="しきい値:").pack(side="left", padx=(10, 5))
+        self.pill_threshold_var = ctk.IntVar(value=PILL_THRESH_DEFAULT)
+        self.pill_threshold_slider = ctk.CTkSlider(
+            ctrl, from_=10, to=200, number_of_steps=190,
+            variable=self.pill_threshold_var, width=250,
+        )
+        self.pill_threshold_slider.pack(side="left", padx=5)
+        ctk.CTkLabel(ctrl, textvariable=self.pill_threshold_var, width=40).pack(
+            side="left", padx=2
+        )
+        ctk.CTkButton(
+            ctrl, text="リセット", width=80,
+            command=lambda: self.pill_threshold_var.set(PILL_THRESH_DEFAULT),
+        ).pack(side="left", padx=10)
+
+        # ── 中央: プレビュー ──
+        self.counting_preview = tk.Label(tab, bg="#000000", text="カメラ未接続", fg="gray")
+        self.counting_preview.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # ── 下部: 計数結果 ──
+        result_frame = ctk.CTkFrame(tab)
+        result_frame.pack(fill="x", padx=5, pady=(0, 5))
+
+        self.pill_count_var = ctk.StringVar(value="合計: 0 個")
+        ctk.CTkLabel(
+            result_frame, textvariable=self.pill_count_var,
+            font=ctk.CTkFont(size=36, weight="bold"),
+            text_color="#00ff88",
+        ).pack(side="left", padx=20, pady=10)
+
+        self.pill_shape_var = ctk.StringVar(value="丸: 0  |  楕円: 0  |  カプセル: 0")
+        ctk.CTkLabel(
+            result_frame, textvariable=self.pill_shape_var,
+            font=ctk.CTkFont(size=18),
+            text_color="#aaaaaa",
+        ).pack(side="left", padx=20, pady=10)
+
     def _build_search_tab(self):
         tab = self.tabview.add("検索")
 
@@ -828,6 +969,13 @@ class App(ctk.CTk):
         except Exception:
             return False
 
+    def is_counting_mode(self) -> bool:
+        """現在計数タブが選択されているか。"""
+        try:
+            return self.tabview.get() == "計数"
+        except Exception:
+            return False
+
     def set_status(self, text: str):
         self.status_var.set(text)
 
@@ -843,6 +991,27 @@ class App(ctk.CTk):
             self._photo_ref = photo
         except Exception:
             pass
+
+    def update_counting_preview(self, frame):
+        """計数モードのプレビュー更新。"""
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            scale = min(PREVIEW_MAX_W / w, PREVIEW_MAX_H / h, 1.0)
+            if scale < 1.0:
+                rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)))
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self.counting_preview.configure(image=photo, text="")
+            self._counting_photo_ref = photo
+        except Exception:
+            pass
+
+    def _update_pill_count(self, total: int, shapes: dict):
+        """計数結果をUIラベルに反映。"""
+        self.pill_count_var.set(f"合計: {total} 個")
+        self.pill_shape_var.set(
+            f"丸: {shapes['丸']}  |  楕円: {shapes['楕円']}  |  カプセル: {shapes['カプセル']}"
+        )
 
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self.base_dir.get())
