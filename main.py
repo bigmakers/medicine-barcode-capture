@@ -326,8 +326,13 @@ class CameraThread(threading.Thread):
             self.app.after(0, lambda: self.app.set_status("エラー: カメラを開けませんでした"))
             return
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        # 最大解像度を要求（カメラが対応する最大値が適用される）
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
+
+        # 実際に適用された解像度を取得
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if actual_fps > 0:
@@ -335,7 +340,9 @@ class CameraThread(threading.Thread):
         self.ring_buffer = deque(maxlen=max(RING_BUFFER_SEC * self.fps, 10))
 
         self.running = True
-        self.app.after(0, lambda: self.app.set_status("カメラ接続済み — 監視中"))
+        res_info = f"カメラ接続済み — {actual_w}x{actual_h} @ {self.fps}fps"
+        self.app.after(0, lambda: self.app.set_status(res_info))
+        print(res_info)
 
         while self.running:
             ret, frame = self.cap.read()
