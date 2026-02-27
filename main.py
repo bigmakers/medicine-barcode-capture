@@ -341,7 +341,10 @@ class CameraThread(threading.Thread):
 
         self.running = True
         res_info = f"カメラ接続済み — {actual_w}x{actual_h} @ {self.fps}fps"
+        res_label = f"解像度: {actual_w} x {actual_h}  |  {self.fps} fps"
         self.app.after(0, lambda: self.app.set_status(res_info))
+        self.app.after(0, lambda: self.app.camera_res_var.set(res_label))
+        self.app.after(100, lambda: self.app._sync_camera_sliders())
         print(res_info)
 
         while self.running:
@@ -677,6 +680,7 @@ class App(ctk.CTk):
         self.db: Database | None = None
         self._photo_ref = None  # PhotoImage の参照保持（GC防止）
         self._counting_photo_ref = None  # 計数プレビュー用
+        self.camera_res_var = ctk.StringVar(value="解像度: ---")
 
         self._build_ui()
         self._init_db()
@@ -761,6 +765,52 @@ class App(ctk.CTk):
         ctk.CTkButton(ctrl2, text="フォルダを開く", width=100, command=self._open_save_dir).pack(
             side="left", padx=5
         )
+
+        # 3段目: 解像度表示 ＋ 明るさ・コントラスト・露出
+        ctrl3 = ctk.CTkFrame(tab)
+        ctrl3.pack(fill="x", padx=5, pady=(0, 5))
+
+        ctk.CTkLabel(
+            ctrl3, textvariable=self.camera_res_var,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#00ccff",
+        ).pack(side="left", padx=(10, 20))
+
+        # 明るさ
+        ctk.CTkLabel(ctrl3, text="明るさ:").pack(side="left", padx=(5, 2))
+        self.brightness_var = ctk.DoubleVar(value=0)
+        self.brightness_slider = ctk.CTkSlider(
+            ctrl3, from_=-64, to=64, variable=self.brightness_var,
+            width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_BRIGHTNESS, v),
+        )
+        self.brightness_slider.pack(side="left", padx=2)
+
+        # コントラスト
+        ctk.CTkLabel(ctrl3, text="コントラスト:").pack(side="left", padx=(10, 2))
+        self.contrast_var = ctk.DoubleVar(value=0)
+        self.contrast_slider = ctk.CTkSlider(
+            ctrl3, from_=0, to=100, variable=self.contrast_var,
+            width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_CONTRAST, v),
+        )
+        self.contrast_slider.pack(side="left", padx=2)
+
+        # 露出
+        ctk.CTkLabel(ctrl3, text="露出:").pack(side="left", padx=(10, 2))
+        self.exposure_var = ctk.DoubleVar(value=0)
+        self.exposure_slider = ctk.CTkSlider(
+            ctrl3, from_=-10, to=0, variable=self.exposure_var,
+            width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_EXPOSURE, v),
+        )
+        self.exposure_slider.pack(side="left", padx=2)
+
+        # シャープネス
+        ctk.CTkLabel(ctrl3, text="シャープネス:").pack(side="left", padx=(10, 2))
+        self.sharpness_var = ctk.DoubleVar(value=0)
+        self.sharpness_slider = ctk.CTkSlider(
+            ctrl3, from_=0, to=255, variable=self.sharpness_var,
+            width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_SHARPNESS, v),
+        )
+        self.sharpness_slider.pack(side="left", padx=2)
 
         # プレビュー（tk.Label で高速な映像更新）
         self.preview = tk.Label(tab, bg="#1a1a1a", text="カメラ未接続", fg="gray")
@@ -1003,6 +1053,28 @@ class App(ctk.CTk):
             return self.tabview.get() == "計数"
         except Exception:
             return False
+
+    def _apply_camera_prop(self, prop_id, value):
+        """スライダー操作時にカメラプロパティを変更する。"""
+        if self.camera_thread and self.camera_thread.cap and self.camera_thread.cap.isOpened():
+            self.camera_thread.cap.set(prop_id, float(value))
+
+    def _sync_camera_sliders(self):
+        """カメラから現在のプロパティ値を読み取ってスライダーに反映する。"""
+        if not self.camera_thread or not self.camera_thread.cap:
+            return
+        cap = self.camera_thread.cap
+        try:
+            b = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+            c = cap.get(cv2.CAP_PROP_CONTRAST)
+            e = cap.get(cv2.CAP_PROP_EXPOSURE)
+            s = cap.get(cv2.CAP_PROP_SHARPNESS)
+            self.brightness_var.set(b)
+            self.contrast_var.set(c)
+            self.exposure_var.set(e)
+            self.sharpness_var.set(s)
+        except Exception:
+            pass
 
     def set_status(self, text: str):
         self.status_var.set(text)
