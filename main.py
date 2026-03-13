@@ -280,6 +280,28 @@ class Database:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ログリダイレクト
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class LogRedirector:
+    """stdout/stderr をキャプチャして、元の出力とアプリ内ログの両方に書き込む。"""
+
+    def __init__(self, original, callback, tag="INFO"):
+        self.original = original
+        self.callback = callback
+        self.tag = tag
+
+    def write(self, text):
+        if self.original:
+            self.original.write(text)
+        if text.strip():
+            self.callback(text.strip(), self.tag)
+
+    def flush(self):
+        if self.original:
+            self.original.flush()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  音声合成ワーカー
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class TTSWorker(threading.Thread):
@@ -767,6 +789,7 @@ class App(ctk.CTk):
         self._build_barcode_tab()
         self._build_counting_tab()
         self._build_search_tab()
+        self._build_log_tab()
 
         self.status_var = ctk.StringVar(value="待機中")
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w").pack(
@@ -1073,6 +1096,126 @@ class App(ctk.CTk):
 
         self.results_frame = ctk.CTkScrollableFrame(tab)
         self.results_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def _build_log_tab(self):
+        """ログタブを構築。アプリ内で全ログ・エラーを確認できる。"""
+        tab = self.tabview.add("ログ")
+
+        # ── 上部: ボタン群 ──
+        ctrl = ctk.CTkFrame(tab)
+        ctrl.pack(fill="x", padx=5, pady=5)
+
+        ctk.CTkButton(
+            ctrl, text="クリア", width=70,
+            fg_color="#e74c3c", hover_color="#c0392b",
+            command=self._clear_log,
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            ctrl, text="コピー", width=70,
+            command=self._copy_log,
+        ).pack(side="left", padx=5)
+
+        self.log_filter_var = ctk.StringVar(value="すべて")
+        ctk.CTkSegmentedButton(
+            ctrl, values=["すべて", "エラー", "カメラ"],
+            variable=self.log_filter_var,
+            command=self._apply_log_filter,
+        ).pack(side="left", padx=15)
+
+        self.log_count_var = ctk.StringVar(value="0 件")
+        ctk.CTkLabel(ctrl, textvariable=self.log_count_var, text_color="#888").pack(
+            side="right", padx=10
+        )
+
+        # ── テキストエリア ──
+        self.log_text = ctk.CTkTextbox(
+            tab, font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="word", state="disabled",
+        )
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+        # ログ内部ストレージ
+        self._log_entries: list[dict] = []
+        self._log_max = 500  # 最大行数
+
+        # stdout/stderr をリダイレクト
+        sys.stdout = LogRedirector(sys.__stdout__, self._add_log, "INFO")
+        sys.stderr = LogRedirector(sys.__stderr__, self._add_log, "ERROR")
+
+    def _add_log(self, text: str, tag: str = "INFO"):
+        """ログエントリを追加する（スレッドセーフ）。"""
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = {"time": ts, "tag": tag, "text": text}
+        self._log_entries.append(entry)
+
+        # 上限を超えたら古いものを削除
+        if len(self._log_entries) > self._log_max:
+            self._log_entries = self._log_entries[-self._log_max:]
+
+        # UIスレッドで表示更新
+        self.after(0, lambda e=entry: self._append_log_line(e))
+
+    def _append_log_line(self, entry: dict):
+        """ログ1行をテキストボックスに追記する。"""
+        current_filter = self.log_filter_var.get()
+        if not self._entry_matches_filter(entry, current_filter):
+            self._update_log_count()
+            return
+
+        tag_label = "ERR" if entry["tag"] == "ERROR" else "   "
+        line = f"[{entry['time']}] {tag_label} {entry['text']}\n"
+
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+        self._update_log_count()
+
+    def _entry_matches_filter(self, entry: dict, filt: str) -> bool:
+        if filt == "すべて":
+            return True
+        if filt == "エラー":
+            return entry["tag"] == "ERROR" or "エラー" in entry["text"] or "error" in entry["text"].lower()
+        if filt == "カメラ":
+            return "カメラ" in entry["text"] or "camera" in entry["text"].lower()
+        return True
+
+    def _apply_log_filter(self, _value=None):
+        """フィルター変更時にログを再描画する。"""
+        current_filter = self.log_filter_var.get()
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        for entry in self._log_entries:
+            if self._entry_matches_filter(entry, current_filter):
+                tag_label = "ERR" if entry["tag"] == "ERROR" else "   "
+                self.log_text.insert("end", f"[{entry['time']}] {tag_label} {entry['text']}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+        self._update_log_count()
+
+    def _update_log_count(self):
+        current_filter = self.log_filter_var.get()
+        count = sum(1 for e in self._log_entries if self._entry_matches_filter(e, current_filter))
+        self.log_count_var.set(f"{count} 件")
+
+    def _clear_log(self):
+        """ログをクリアする。"""
+        self._log_entries.clear()
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.log_count_var.set("0 件")
+
+    def _copy_log(self):
+        """ログ内容をクリップボードにコピーする。"""
+        self.log_text.configure(state="normal")
+        content = self.log_text.get("1.0", "end").strip()
+        self.log_text.configure(state="disabled")
+        if content:
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            self.set_status("ログをクリップボードにコピーしました")
 
     # ────────────────────────────────────
     #  カメラ制御
