@@ -131,17 +131,37 @@ def save_frame_as_jpg(filepath: str, frame, quality: int = 95) -> bool:
         return False
 
 
-def detect_cameras(max_index: int = 8) -> list[dict]:
-    """接続されているカメラを検出してリストで返す。"""
+def _camera_backend():
+    """OS に応じた推奨バックエンドを返す。"""
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW      # Windows: DirectShow が安定
+    elif sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_ANY
+
+
+def detect_cameras(max_index: int = 5) -> list[dict]:
+    """接続されているカメラを検出してリストで返す。
+    カメラを占有する時間を最小限に抑えて即座に解放する。
+    """
+    backend = _camera_backend()
     cameras = []
     for i in range(max_index):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            name = cap.get(cv2.CAP_PROP_BACKEND)
-            cameras.append({"index": i, "width": w, "height": h})
-            cap.release()
+        cap = None
+        try:
+            cap = cv2.VideoCapture(i, backend)
+            if cap.isOpened():
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                bk_name = cap.getBackendName() if hasattr(cap, "getBackendName") else "?"
+                cameras.append({"index": i, "width": w, "height": h, "backend": bk_name})
+                print(f"カメラ検出: index={i}, {w}x{h}, backend={bk_name}")
+        except Exception as e:
+            print(f"カメラ index={i}: 検出エラー — {e}")
+        finally:
+            if cap is not None:
+                cap.release()
+        time.sleep(0.3)  # カメラ解放を確実に待つ (Windows で重要)
     return cameras
 
 
@@ -335,7 +355,12 @@ class CameraThread(threading.Thread):
     #  メインループ
     # ──────────────────────────────────
     def run(self):
-        self.cap = cv2.VideoCapture(self.camera_index)
+        backend = _camera_backend()
+        self.cap = cv2.VideoCapture(self.camera_index, backend)
+        if not self.cap.isOpened():
+            # バックエンド指定で失敗した場合、デフォルトで再試行
+            print(f"カメラ {self.camera_index} (backend={backend}) で開けず、デフォルトで再試行")
+            self.cap = cv2.VideoCapture(self.camera_index)
         if not self.cap.isOpened():
             self.app.after(0, lambda: self.app.set_status("エラー: カメラを開けませんでした"))
             return
@@ -1111,7 +1136,7 @@ class App(ctk.CTk):
 
         labels = []
         for cam in cameras:
-            labels.append(f"カメラ {cam['index']}  ({cam['width']}x{cam['height']})")
+            labels.append(self._camera_label(cam))
         self.camera_combo.configure(values=labels)
 
         # 保存済みのカメラ番号と一致するものを選択
@@ -1124,13 +1149,16 @@ class App(ctk.CTk):
         self.camera_combo_var.set(selected)
         self.set_status(f"{len(cameras)} 台のカメラを検出")
 
+    @staticmethod
+    def _camera_label(cam: dict) -> str:
+        return f"カメラ {cam['index']}  ({cam['width']}x{cam['height']}  {cam.get('backend', '')})"
+
     def _on_camera_selected(self, choice: str):
         """ドロップダウンでカメラが選択されたときにcamera_indexを更新。"""
         if not hasattr(self, "_detected_cameras"):
             return
         for cam in self._detected_cameras:
-            label = f"カメラ {cam['index']}  ({cam['width']}x{cam['height']})"
-            if label == choice:
+            if self._camera_label(cam) == choice:
                 self.camera_index.set(cam["index"])
                 self._save_config()
                 break
