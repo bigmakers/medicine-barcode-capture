@@ -59,6 +59,16 @@ DEFAULT_BASE_DIR = str(Path.home() / "MedicineCaptures")
 DB_NAME = "captures.db"
 CONFIG_PATH = str(Path.home() / ".medicine_capture_config.json")
 
+# ── 解像度プリセット ──
+RESOLUTION_PRESETS = [
+    ("最大 (自動)", 9999, 9999),
+    ("4K (3840x2160)", 3840, 2160),
+    ("3264x2448", 3264, 2448),
+    ("1920x1080 (FHD)", 1920, 1080),
+    ("1280x720 (HD)", 1280, 720),
+    ("640x480 (VGA)", 640, 480),
+]
+
 # ── 動体検知パラメータ ──
 MOTION_AREA_RATIO = 0.005       # 画面面積のこの割合以上が変化 → 動体あり
 MOTION_COOLDOWN_SEC = 3.0       # 撮影完了後、再検知を抑制する秒数
@@ -387,9 +397,10 @@ class CameraThread(threading.Thread):
             self.app.after(0, lambda: self.app.set_status("エラー: カメラを開けませんでした"))
             return
 
-        # 最大解像度を要求（カメラが対応する最大値が適用される）
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
+        # 選択された解像度を適用
+        req_w, req_h = self.app._get_selected_resolution()
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
 
         # 実際に適用された解像度を取得
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -764,6 +775,7 @@ class App(ctk.CTk):
         config = {
             "base_dir": self.base_dir.get(),
             "camera_index": self.camera_index.get(),
+            "resolution": self.resolution_var.get() if hasattr(self, "resolution_var") else "最大 (自動)",
         }
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -846,48 +858,63 @@ class App(ctk.CTk):
             side="left", padx=5
         )
 
-        # 3段目: 解像度表示 ＋ 明るさ・コントラスト・露出
+        # 3段目: 解像度選択 ＋ 実解像度表示
         ctrl3 = ctk.CTkFrame(tab)
-        ctrl3.pack(fill="x", padx=5, pady=(0, 5))
+        ctrl3.pack(fill="x", padx=5, pady=(0, 3))
+
+        ctk.CTkLabel(ctrl3, text="解像度:").pack(side="left", padx=(10, 2))
+        saved_res = self._load_config().get("resolution", "最大 (自動)")
+        self.resolution_var = ctk.StringVar(value=saved_res)
+        self.resolution_combo = ctk.CTkComboBox(
+            ctrl3, variable=self.resolution_var, width=200,
+            values=[r[0] for r in RESOLUTION_PRESETS],
+            state="readonly",
+            command=self._on_resolution_changed,
+        )
+        self.resolution_combo.pack(side="left", padx=2)
 
         ctk.CTkLabel(
             ctrl3, textvariable=self.camera_res_var,
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#00ccff",
-        ).pack(side="left", padx=(10, 20))
+        ).pack(side="left", padx=(15, 10))
+
+        # 4段目: 明るさ・コントラスト・露出・シャープネス
+        ctrl4 = ctk.CTkFrame(tab)
+        ctrl4.pack(fill="x", padx=5, pady=(0, 5))
 
         # 明るさ
-        ctk.CTkLabel(ctrl3, text="明るさ:").pack(side="left", padx=(5, 2))
+        ctk.CTkLabel(ctrl4, text="明るさ:").pack(side="left", padx=(10, 2))
         self.brightness_var = ctk.DoubleVar(value=0)
         self.brightness_slider = ctk.CTkSlider(
-            ctrl3, from_=-64, to=64, variable=self.brightness_var,
+            ctrl4, from_=-64, to=64, variable=self.brightness_var,
             width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_BRIGHTNESS, v),
         )
         self.brightness_slider.pack(side="left", padx=2)
 
         # コントラスト
-        ctk.CTkLabel(ctrl3, text="コントラスト:").pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(ctrl4, text="コントラスト:").pack(side="left", padx=(10, 2))
         self.contrast_var = ctk.DoubleVar(value=0)
         self.contrast_slider = ctk.CTkSlider(
-            ctrl3, from_=0, to=100, variable=self.contrast_var,
+            ctrl4, from_=0, to=100, variable=self.contrast_var,
             width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_CONTRAST, v),
         )
         self.contrast_slider.pack(side="left", padx=2)
 
         # 露出
-        ctk.CTkLabel(ctrl3, text="露出:").pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(ctrl4, text="露出:").pack(side="left", padx=(10, 2))
         self.exposure_var = ctk.DoubleVar(value=0)
         self.exposure_slider = ctk.CTkSlider(
-            ctrl3, from_=-10, to=0, variable=self.exposure_var,
+            ctrl4, from_=-10, to=0, variable=self.exposure_var,
             width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_EXPOSURE, v),
         )
         self.exposure_slider.pack(side="left", padx=2)
 
         # シャープネス
-        ctk.CTkLabel(ctrl3, text="シャープネス:").pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(ctrl4, text="シャープネス:").pack(side="left", padx=(10, 2))
         self.sharpness_var = ctk.DoubleVar(value=0)
         self.sharpness_slider = ctk.CTkSlider(
-            ctrl3, from_=0, to=255, variable=self.sharpness_var,
+            ctrl4, from_=0, to=255, variable=self.sharpness_var,
             width=120, command=lambda v: self._apply_camera_prop(cv2.CAP_PROP_SHARPNESS, v),
         )
         self.sharpness_slider.pack(side="left", padx=2)
@@ -1305,6 +1332,29 @@ class App(ctk.CTk):
                 self.camera_index.set(cam["index"])
                 self._save_config()
                 break
+
+    def _on_resolution_changed(self, _value=None):
+        """解像度ドロップダウンが変更されたとき。設定を保存し、カメラに即反映。"""
+        self._save_config()
+        res_name = self.resolution_var.get()
+        # カメラ動作中なら即座に解像度を変更
+        if self.camera_thread and self.camera_thread.cap and self.camera_thread.cap.isOpened():
+            w, h = self._get_selected_resolution()
+            self.camera_thread.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            self.camera_thread.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            actual_w = int(self.camera_thread.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.camera_thread.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            res_label = f"解像度: {actual_w} x {actual_h}  |  {self.camera_thread.fps} fps"
+            self.camera_res_var.set(res_label)
+            print(f"解像度変更: {res_name} → 実際 {actual_w}x{actual_h}")
+
+    def _get_selected_resolution(self) -> tuple[int, int]:
+        """選択中の解像度プリセットから (width, height) を返す。"""
+        res_name = self.resolution_var.get()
+        for name, w, h in RESOLUTION_PRESETS:
+            if name == res_name:
+                return w, h
+        return 9999, 9999  # デフォルト: 最大
 
     def _apply_camera_prop(self, prop_id, value):
         """スライダー操作時にカメラプロパティを変更する。"""
