@@ -131,6 +131,20 @@ def save_frame_as_jpg(filepath: str, frame, quality: int = 95) -> bool:
         return False
 
 
+def detect_cameras(max_index: int = 8) -> list[dict]:
+    """接続されているカメラを検出してリストで返す。"""
+    cameras = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            name = cap.get(cv2.CAP_PROP_BACKEND)
+            cameras.append({"index": i, "width": w, "height": h})
+            cap.release()
+    return cameras
+
+
 def open_file(filepath: str):
     """OS既定のアプリケーションでファイルを開く。"""
     if not os.path.exists(filepath):
@@ -682,8 +696,13 @@ class App(ctk.CTk):
         self._counting_photo_ref = None  # 計数プレビュー用
         self.camera_res_var = ctk.StringVar(value="解像度: ---")
 
+        self._detected_cameras: list[dict] = []
+
         self._build_ui()
         self._init_db()
+
+        # 起動時にカメラを自動検出
+        self.after(300, self._detect_cameras)
 
     def _load_config(self) -> dict:
         """設定ファイルを読み込む。"""
@@ -735,8 +754,21 @@ class App(ctk.CTk):
         ctrl = ctk.CTkFrame(tab)
         ctrl.pack(fill="x", padx=5, pady=5)
 
-        ctk.CTkLabel(ctrl, text="カメラ番号:").pack(side="left", padx=(10, 2))
-        ctk.CTkEntry(ctrl, textvariable=self.camera_index, width=50).pack(side="left", padx=2)
+        ctk.CTkLabel(ctrl, text="カメラ:").pack(side="left", padx=(10, 2))
+        self.camera_combo_var = ctk.StringVar(value="")
+        self.camera_combo = ctk.CTkComboBox(
+            ctrl, variable=self.camera_combo_var, width=300,
+            values=["カメラ未検出"], state="readonly",
+            command=self._on_camera_selected,
+        )
+        self.camera_combo.pack(side="left", padx=2)
+
+        self.btn_detect = ctk.CTkButton(
+            ctrl, text="検出", width=60,
+            fg_color="#3498db", hover_color="#2980b9",
+            command=self._detect_cameras,
+        )
+        self.btn_detect.pack(side="left", padx=3)
 
         self.btn_start = ctk.CTkButton(ctrl, text="▶ 開始", width=80, command=self.start_camera)
         self.btn_start.pack(side="left", padx=5)
@@ -1053,6 +1085,55 @@ class App(ctk.CTk):
             return self.tabview.get() == "計数"
         except Exception:
             return False
+
+    def _detect_cameras(self):
+        """接続カメラを検出してドロップダウンに反映する。"""
+        self.set_status("カメラ検出中...")
+        self.btn_detect.configure(state="disabled")
+        self._detected_cameras = []
+
+        def _scan():
+            cams = detect_cameras()
+            self.after(0, lambda: self._update_camera_list(cams))
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _update_camera_list(self, cameras: list[dict]):
+        """検出結果をドロップダウンに反映する。"""
+        self._detected_cameras = cameras
+        self.btn_detect.configure(state="normal")
+
+        if not cameras:
+            self.camera_combo.configure(values=["カメラが見つかりません"])
+            self.camera_combo_var.set("カメラが見つかりません")
+            self.set_status("カメラが検出されませんでした")
+            return
+
+        labels = []
+        for cam in cameras:
+            labels.append(f"カメラ {cam['index']}  ({cam['width']}x{cam['height']})")
+        self.camera_combo.configure(values=labels)
+
+        # 保存済みのカメラ番号と一致するものを選択
+        saved_idx = self.camera_index.get()
+        selected = labels[0]
+        for i, cam in enumerate(cameras):
+            if cam["index"] == saved_idx:
+                selected = labels[i]
+                break
+        self.camera_combo_var.set(selected)
+        self.set_status(f"{len(cameras)} 台のカメラを検出")
+
+    def _on_camera_selected(self, choice: str):
+        """ドロップダウンでカメラが選択されたときにcamera_indexを更新。"""
+        if not hasattr(self, "_detected_cameras"):
+            return
+        for cam in self._detected_cameras:
+            label = f"カメラ {cam['index']}  ({cam['width']}x{cam['height']})"
+            if label == choice:
+                self.camera_index.set(cam["index"])
+                self._save_config()
+                break
 
     def _apply_camera_prop(self, prop_id, value):
         """スライダー操作時にカメラプロパティを変更する。"""
